@@ -1,0 +1,10 @@
+# build artifacts — gerados por ./build.sh, nunca commitar
+RAMBar
+RAMBar-arm64
+RAMBar-x86_64
+RAMBar.app/
+*.o
+*.d
+
+# macOS
+.DS_Store
