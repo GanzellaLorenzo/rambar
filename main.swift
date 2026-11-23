@@ -69,12 +69,97 @@ func currentSnapshot(total: UInt64, pageSize: UInt64) -> MemSnapshot? {
     )
 }
 
+// MARK: - WindowServer (lido do log do wsmon, sem rodar `top`)
+
+struct WSSample {
+    let mb: Int
+    let at: Date
+}
+
+private let wsLogPath = (NSHomeDirectory() as NSString)
+    .appendingPathComponent("Library/Logs/wsmon.log")
+
+private let wsLogFormatter: DateFormatter = {
+    let f = DateFormatter()
+    f.locale = Locale(identifier: "en_US_POSIX")
+    f.timeZone = .current
+    f.dateFormat = "yyyy-MM-dd HH:mm"
+    return f
+}()
+
+/// Última linha do log do wsmon: `2026-11-23 14:54,489`
+func loadWindowServerSample() -> WSSample? {
+    guard let data = FileManager.default.contents(atPath: wsLogPath),
+          let text = String(data: data, encoding: .utf8) else { return nil }
+    let lines = text.split(whereSeparator: \.isNewline)
+    guard let last = lines.last else { return nil }
+    let parts = last.split(separator: ",", maxSplits: 1)
+    guard parts.count == 2,
+          let mb = Int(parts[1].trimmingCharacters(in: .whitespaces)),
+          let at = wsLogFormatter.date(from: String(parts[0])) else { return nil }
+    return WSSample(mb: mb, at: at)
+}
+
+/// PID do WindowServer (resolvido uma vez; sobrevive até o próximo reboot).
+private func resolveWindowServerPID() -> pid_t? {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
+    p.arguments = ["-x", "WindowServer"]
+    let pipe = Pipe()
+    p.standardOutput = pipe
+    p.standardError = FileHandle.nullDevice
+    do { try p.run() } catch { return nil }
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    p.waitUntilExit()
+    guard let text = String(data: data, encoding: .utf8)?
+        .trimmingCharacters(in: .whitespacesAndNewlines),
+          let pid = pid_t(text) else { return nil }
+    return pid
+}
+
+/// Footprint ao vivo via `top` (~0,36 s). Requer root para `proc_pid_rusage`,
+/// por isso `top` é o único caminho sem privilégio.
+func loadWindowServerFootprintMB(pid: pid_t) -> Int? {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: "/usr/bin/top")
+    p.arguments = ["-l", "1", "-pid", "\(pid)", "-stats", "mem"]
+    let pipe = Pipe()
+    p.standardOutput = pipe
+    p.standardError = FileHandle.nullDevice
+    do { try p.run() } catch { return nil }
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    p.waitUntilExit()
+    guard let text = String(data: data, encoding: .utf8) else { return nil }
+    for raw in text.split(whereSeparator: \.isNewline).reversed() {
+        let line = raw.trimmingCharacters(in: .whitespaces)
+        if line.hasSuffix("M"), let v = Int(line.dropLast()) { return v }
+        if line.hasSuffix("G"), let v = Double(line.dropLast()) { return Int(v * 1024) }
+    }
+    return nil
+}
+
 // MARK: - Formatting
 
 private let ptBRLocale = Locale(identifier: "pt_BR")
 
 func formatGB(_ bytes: UInt64) -> String {
     String(format: "%.1f GB", locale: ptBRLocale, Double(bytes) / 1_073_741_824.0)
+}
+
+func formatMB(_ mb: Int) -> String {
+    if mb >= 1024 {
+        return String(format: "%.1f GB", locale: ptBRLocale, Double(mb) / 1024.0)
+    }
+    return "\(mb) MB"
+}
+
+func formatAge(_ date: Date) -> String {
+    let minutes = Int(Date().timeIntervalSince(date) / 60)
+    if minutes < 1 { return "agora" }
+    if minutes < 60 { return "há \(minutes) min" }
+    let hours = minutes / 60
+    if hours < 24 { return "há \(hours) h" }
+    return "há \(hours / 24) d"
 }
 
 // MARK: - App
@@ -88,19 +173,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let usedItem = NSMenuItem(title: "Em Uso: …", action: nil, keyEquivalent: "")
     private let availItem = NSMenuItem(title: "Disponível: …", action: nil, keyEquivalent: "")
     private let swapItem = NSMenuItem(title: "Swap Usado: …", action: nil, keyEquivalent: "")
+    private let wsItem = NSMenuItem(title: "WindowServer: …", action: nil, keyEquivalent: "")
+
+    /// Limiar de atenção: o reboot é recomendado acima disto.
+    private let wsAlertMB = 1200
+    private let wsWarnMB = 900
 
     private let totalBytes: UInt64 = loadTotalBytes()
     private let pageSize: UInt64 = loadPageSize()
+    private let wsPID: pid_t? = resolveWindowServerPID()
 
     private static let cachedIcon: NSImage? = {
-        let cfg = NSImage.SymbolConfiguration(pointSize: 16, weight: .medium)
+        let cfg = NSImage.SymbolConfiguration(pointSize: 15, weight: .medium)
         guard let img = NSImage(
             systemSymbolName: "memorychip",
             accessibilityDescription: "Monitor de RAM"
         ) else { return nil }
         let configured = img.withSymbolConfiguration(cfg) ?? img
         configured.isTemplate = true
-        configured.size = NSSize(width: 16, height: 16)
+        configured.size = NSSize(width: 15, height: 15)
         return configured
     }()
 
@@ -113,10 +204,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             button.setAccessibilityLabel("Monitor de RAM")
         }
 
-        for item in [totalItem, usedItem, availItem, swapItem] {
+        for item in [totalItem, usedItem, availItem, swapItem, wsItem] {
             item.isEnabled = false
             menu.addItem(item)
         }
+        menu.addItem(.separator())
+        let openLog = NSMenuItem(title: "Abrir log do wsmon", action: #selector(openLog), keyEquivalent: "")
+        openLog.target = self
+        menu.addItem(openLog)
         menu.addItem(.separator())
         let quit = NSMenuItem(title: "Sair", action: #selector(quit), keyEquivalent: "q")
         quit.target = self
@@ -130,7 +225,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         refresh()
     }
 
+    /// Zero polling: mede ao vivo no clique; cai para o log se falhar.
+    private func refreshWS() {
+        var mb: Int?
+        var age: String = "agora"
+        if let pid = wsPID, let live = loadWindowServerFootprintMB(pid: pid) {
+            mb = live
+        } else if let sample = loadWindowServerSample() {
+            mb = sample.mb
+            age = formatAge(sample.at)
+        }
+        guard let value = mb else {
+            wsItem.title = "WindowServer: sem dados"
+            return
+        }
+        let formatted = formatMB(value)
+        let text = "WindowServer: \(formatted) (\(age))"
+        let color: NSColor
+        if value >= wsAlertMB {
+            color = .systemRed
+        } else if value >= wsWarnMB {
+            color = .systemOrange
+        } else {
+            color = .labelColor
+        }
+        let attributed = NSMutableAttributedString(string: text)
+        attributed.addAttribute(
+            .foregroundColor,
+            value: color,
+            range: (text as NSString).range(of: formatted)
+        )
+        wsItem.attributedTitle = attributed
+        wsItem.toolTip = "Footprint do WindowServer medido no clique; reboot acima de \(wsAlertMB) MB"
+    }
+
     private func refresh() {
+        refreshWS()
         guard let snap = currentSnapshot(total: totalBytes, pageSize: pageSize) else {
             totalItem.title = "Memória Total: indisponível"
             usedItem.title = "Em Uso: indisponível"
@@ -143,9 +273,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         usedItem.title = "Em Uso: \(formatGB(snap.used)) (\(snap.percent)%)"
         availItem.title = "Disponível: \(formatGB(snap.available))"
         swapItem.title = "Swap Usado: \(formatGB(snap.swapUsed))"
-        let tip = "\(formatGB(snap.used)) de \(formatGB(snap.total)) em uso — inclui cache liberável"
-        statusItem.button?.toolTip = tip
-        statusItem.button?.setAccessibilityLabel("RAM: \(tip)")
+        statusItem.button?.setAccessibilityLabel("RAM \(snap.percent)% — WindowServer")
+    }
+
+    @objc private func openLog() {
+        NSWorkspace.shared.open(URL(fileURLWithPath: wsLogPath))
     }
 
     @objc private func quit() {

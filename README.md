@@ -1,7 +1,7 @@
-# RAMBar — visualizador de RAM ultra-leve (menubar)
+# RAMBar — RAM + WindowServer na menubar
 
 Ícone estático na menubar. **Zero timer, zero polling, zero rede.**
-Só consulta o kernel na hora do clique e volta a dormir.
+Só lê o kernel (e o log do wsmon) na hora do clique e volta a dormir.
 
 ## Escopo
 
@@ -11,10 +11,25 @@ Clique mostra (pt-BR, GB base 1024³ igual à Apple):
 - Em Uso (abs + %)
 - Disponível (= total − usada, inclui cache liberável)
 - Swap Usado
+- **WindowServer** (valor + há quanto tempo foi medido)
+- Abrir log do wsmon
 - Sair
 
-O ícone é estático e monocromático. Sem timer, sem polling, sem rede:
-só consulta o kernel na hora do clique e volta a dormir.
+O ícone é estático e monocromático. Sem timer, sem polling, sem rede.
+
+## De onde vem o número do WindowServer
+
+Do log do monitor já existente, `~/Library/Logs/wsmon.log`
+(LaunchAgent `com.voce.wsmon`, linha `2026-11-23 14:54,489`):
+
+- **não** roda `top` (que custa ~0,2 s de CPU e um processo por chamada)
+- **não** precisa de root (`footprint` no WindowServer exige)
+- é só ler a última linha de um arquivo pequeno, **no clique**
+
+O valor aparece colorido: neutro `< 900 MB`, laranja `≥ 900 MB`,
+vermelho `≥ 1.2 GB`. A idade entre parênteses mostra se o dado
+está fresco (o wsmon grava a cada 30 min). Se o log não existir,
+mostra "sem dados".
 
 ## Arquivos
 
@@ -48,8 +63,8 @@ Requer: macOS 13+, Xcode Command Line Tools (`xcode-select --install`).
 
 ## Custo real esperado (honesto, não "zero absoluto")
 
-- `0.0%` CPU (arredondamento), 0–2 wakeups/s, Energy 0–1
-- `phys_footprint` ~12–18MB (piso Swift runtime + AppKit, inevitável)
+- `0.0%` CPU, **0 wakeups** (sem timer; só acorda no clique)
+- `phys_footprint` ~22MB (piso Swift runtime + AppKit, inevitável)
 
 Medir (após 5min warmup):
 
